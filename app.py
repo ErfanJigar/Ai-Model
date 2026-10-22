@@ -97,7 +97,9 @@ def get_model() -> Llama:
         _model = Llama(
             model_path=str(MODEL_PATH),
             chat_format="chatml",
-            n_ctx=1000000000,
+            # 128 was too small: the system prompt alone plus generation needed 329 tokens.
+            # 384 keeps this request in range while using a modest KV cache.
+            n_ctx=384,
             n_threads=1,
             n_threads_batch=1,
             n_batch=64,
@@ -116,18 +118,39 @@ def generate_reply_sync(chat_id: str, user_text: str) -> str:
     # One inference at a time: this is safer for the tiny CPU/RAM plan.
     with _inference_lock:
         history = _conversations.setdefault(chat_id, [])
+        # Keep only one previous turn to reduce context use on the tiny instance.
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend(history[-4:])
-        messages.append({"role": "user", "content": user_text[:700]})
+        messages.extend(history[-2:])
+        messages.append({"role": "user", "content": user_text[:400]})
 
         model = get_model()
-        result: dict[str, Any] = model.create_chat_completion(
-            messages=messages,
-            max_tokens=64,
-            temperature=0.25,
-            top_p=0.8,
-            repeat_penalty=1.05,
-        )
+        try:
+            result: dict[str, Any] = model.create_chat_completion(
+                messages=messages,
+                max_tokens=24,
+                temperature=0.25,
+                top_p=0.8,
+                repeat_penalty=1.05,
+            )
+        except ValueError as exc:
+            # If the prompt plus generated tokens still exceed context, retry
+            # once without chat history and with a shorter user message.
+            if "exceed context window" not in str(exc):
+                raise
+            logger.warning(
+                "Prompt exceeded context; retrying with shortened input and no history"
+            )
+            retry_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text[:180]},
+            ]
+            result = model.create_chat_completion(
+                messages=retry_messages,
+                max_tokens=16,
+                temperature=0.25,
+                top_p=0.8,
+                repeat_penalty=1.05,
+            )
         reply = (
             result.get("choices", [{}])[0]
             .get("message", {})
@@ -139,12 +162,12 @@ def generate_reply_sync(chat_id: str, user_text: str) -> str:
 
         history.extend(
             [
-                {"role": "user", "content": user_text[:700]},
+                {"role": "user", "content": user_text[:400]},
                 {"role": "assistant", "content": reply},
             ]
         )
-        # Retain only two recent user/assistant turns per chat.
-        _conversations[chat_id] = history[-4:]
+        # Retain only the last user/assistant turn per chat.
+        _conversations[chat_id] = history[-2:]
         return reply
 
 
