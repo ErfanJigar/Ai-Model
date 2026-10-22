@@ -97,7 +97,7 @@ def get_model() -> Llama:
         _model = Llama(
             model_path=str(MODEL_PATH),
             chat_format="chatml",
-            n_ctx=128,
+            n_ctx=1000000000,
             n_threads=1,
             n_threads_batch=1,
             n_batch=64,
