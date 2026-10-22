@@ -1,12 +1,26 @@
+import asyncio
+import logging
 import os
 import threading
 import urllib.request
 from pathlib import Path
+from typing import Any
 
-from flask import Flask, jsonify, render_template_string, request
 from llama_cpp import Llama
+from maxrubika import Bot
 
-APP_DIR = Path(__file__).resolve().parent
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("qwen-rubika-bot")
+
+# ----------------------------
+# Model configuration
+# ----------------------------
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/tmp/qwen-model"))
 MODEL_PATH = MODEL_DIR / "qwen2.5-0.5b-instruct-q4_k_m.gguf"
 MODEL_URL = (
@@ -14,72 +28,70 @@ MODEL_URL = (
     "qwen2.5-0.5b-instruct-q4_k_m.gguf"
 )
 
-app = Flask(__name__)
-_model = None
+_model: Llama | None = None
 _model_lock = threading.Lock()
+_inference_lock = threading.Lock()
 
-PAGE = r'''<!doctype html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Qwen محلی</title>
-<style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#10131b;color:#edf0f7;font-family:Tahoma,Arial,sans-serif;display:flex;justify-content:center;min-height:100vh;padding:18px}.app{width:min(780px,100%);display:flex;flex-direction:column;gap:14px}.top{padding:18px;border:1px solid #303748;border-radius:16px;background:#171c27}.top h1{font-size:20px;margin:0 0 8px}.top p{margin:0;color:#aab3c5;font-size:13px;line-height:1.9}.chat{border:1px solid #303748;border-radius:16px;background:#141923;min-height:42vh;max-height:62vh;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px}.msg{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.9;padding:12px 14px;border-radius:12px;max-width:94%}.user{align-self:flex-start;background:#263b61}.bot{align-self:flex-end;background:#202938}.status{font-size:12px;color:#c7d1e4;min-height:20px;line-height:1.8}.form{display:flex;gap:8px}.form textarea{flex:1;resize:vertical;min-height:66px;max-height:180px;background:#171c27;color:#fff;border:1px solid #394257;border-radius:12px;padding:12px;font:inherit;line-height:1.7}.form button{border:0;border-radius:12px;padding:0 18px;background:#8aa4ff;color:#071022;font-weight:bold;cursor:pointer}.form button:disabled{opacity:.5;cursor:wait}.foot{font-size:11px;color:#8993a6;line-height:1.9}@media(max-width:520px){body{padding:10px}.form{flex-direction:column}.form button{padding:12px}}
-</style></head>
-<body><main class="app">
-<section class="top"><h1>چت‌بات Qwen محلی</h1><p>بدون API هوش مصنوعی؛ مدل از Hugging Face دانلود و روی همین سرویس اجرا می‌شود. دانلود مدل به اینترنت نیاز دارد. روی پلن رایگان ۵۱۲ مگابایتی ممکن است به علت کمبود RAM اجرا نشود.</p></section>
-<section id="chat" class="chat" aria-live="polite"><div class="msg bot">سلام! یک سؤال کوتاه بپرس. بار اول ممکن است دانلود مدل زمان ببرد.</div></section>
-<div id="status" class="status"></div>
-<form id="form" class="form"><textarea id="input" maxlength="1000" placeholder="پیامت را بنویس..." required></textarea><button id="send" type="submit">ارسال</button></form>
-<div class="foot">مدل: Qwen2.5-0.5B-Instruct Q4_K_M · بدون API هوش مصنوعی · پاسخ‌ها ممکن است کند یا نادقیق باشند. سرویس رایگان Render در زمان بیکاری خاموش می‌شود و فایل مدل ممکن است مجدداً دانلود شود.</div>
-</main><script>
-const form=document.getElementById('form'),input=document.getElementById('input'),chat=document.getElementById('chat'),statusEl=document.getElementById('status'),send=document.getElementById('send');
-const history=[];
-function add(text,who){const el=document.createElement('div');el.className='msg '+who;el.textContent=text;chat.appendChild(el);chat.scrollTop=chat.scrollHeight;}
-form.addEventListener('submit',async e=>{e.preventDefault();const text=input.value.trim();if(!text)return;add(text,'user');history.push({role:'user',content:text});input.value='';send.disabled=true;statusEl.textContent='در صورت اولین اجرا، فایل حدود ۴۹۱ مگابایتی دانلود می‌شود. لطفاً منتظر بمان؛ اگر سرویس کمبود حافظه داشته باشد ممکن است متوقف شود.';try{const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages:history.slice(-4)})});let data={};try{data=await r.json()}catch(_){}if(!r.ok)throw new Error(data.error||'پاسخی از سرویس دریافت نشد');add(data.reply||'پاسخی تولید نشد.','bot');history.push({role:'assistant',content:data.reply||''});}catch(err){add('خطا: '+err.message,'bot');statusEl.textContent='بخش Logs در داشبورد Render را بررسی کن؛ خطای Out of memory یعنی حافظه کافی نیست.';}finally{send.disabled=false;input.focus();if(statusEl.textContent.startsWith('در صورت اولین اجرا'))statusEl.textContent='';}});
-</script></body></html>'''
+SYSTEM_PROMPT = (
+    "You are a helpful assistant. Reply briefly in the same language as the user. "
+    "If the user writes Persian, try to answer in Persian. Be honest if you do not know."
+)
+
+# Keep a short conversation history separately for each Rubika chat.
+# Entries are protected by _inference_lock because model generation is serialized.
+_conversations: dict[str, list[dict[str, str]]] = {}
 
 
-def ensure_model_file():
-    """Download the public GGUF file only when it is not already on this instance."""
+def ensure_model_file() -> None:
+    """Download the public GGUF model to temporary disk, without loading it into RAM."""
     if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 400_000_000:
+        logger.info("Model file already exists: %s bytes", MODEL_PATH.stat().st_size)
         return
+
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     partial = MODEL_PATH.with_suffix(MODEL_PATH.suffix + ".part")
     try:
-        req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "qwen-local-render/1.0"})
-        # urllib's timeout is a socket inactivity timeout; the loop streams the large file.
+        logger.info("Downloading Qwen GGUF model from Hugging Face; this is about 491 MB.")
+        req = urllib.request.Request(
+            MODEL_URL,
+            headers={"User-Agent": "qwen-local-rubika-render/1.0"},
+        )
         with urllib.request.urlopen(req, timeout=120) as response, partial.open("wb") as output:
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
                 output.write(chunk)
-        if partial.stat().st_size < 400_000_000:
-            raise RuntimeError(f"فایل مدل ناقص دانلود شده است ({partial.stat().st_size} bytes).")
+
+        size = partial.stat().st_size
+        if size < 400_000_000:
+            raise RuntimeError(f"The downloaded model looks incomplete ({size} bytes).")
         partial.replace(MODEL_PATH)
+        logger.info("Model download complete: %s bytes", size)
     finally:
         if partial.exists():
             try:
                 partial.unlink()
             except OSError:
-                pass
+                logger.warning("Could not delete incomplete model download: %s", partial)
 
 
-def get_model():
+def get_model() -> Llama:
     global _model
     if _model is not None:
         return _model
+
     with _model_lock:
         if _model is not None:
             return _model
+
         ensure_model_file()
-        # Intentionally conservative values for a tiny CPU/RAM plan.
-        # These settings reduce memory use; they cannot make a 491 MB model fit in 512 MB reliably.
+        logger.info("Loading Qwen model into memory. The free 512 MB plan may run out of RAM.")
         _model = Llama(
             model_path=str(MODEL_PATH),
             n_ctx=128,
             n_threads=1,
+            n_threads_batch=1,
             n_batch=64,
             n_ubatch=8,
             n_gpu_layers=0,
@@ -87,53 +99,139 @@ def get_model():
             use_mlock=False,
             verbose=False,
         )
+        logger.info("Qwen model loaded successfully")
         return _model
 
 
-@app.get("/")
-def index():
-    return render_template_string(PAGE)
+def generate_reply_sync(chat_id: str, user_text: str) -> str:
+    """Run the synchronous llama.cpp inference outside the Rubika event loop."""
+    # One inference at a time: this is safer for the tiny CPU/RAM plan.
+    with _inference_lock:
+        history = _conversations.setdefault(chat_id, [])
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(history[-4:])
+        messages.append({"role": "user", "content": user_text[:700]})
 
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "model_loaded": _model is not None})
-
-
-@app.post("/chat")
-def chat():
-    payload = request.get_json(silent=True) or {}
-    messages = payload.get("messages", [])
-    if not isinstance(messages, list) or not messages:
-        return jsonify({"error": "پیام معتبری دریافت نشد."}), 400
-
-    cleaned = [{"role": "system", "content": "You are a helpful assistant. Reply briefly in the same language as the user. If the user writes Persian, try to answer in Persian. Be honest if you do not know."}]
-    for item in messages[-4:]:
-        if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
-            continue
-        content = str(item.get("content", ""))[:350].strip()
-        if content:
-            cleaned.append({"role": item["role"], "content": content})
-    if len(cleaned) < 2 or cleaned[-1]["role"] != "user":
-        return jsonify({"error": "آخرین پیام باید از طرف کاربر باشد."}), 400
-
-    try:
         model = get_model()
-        result = model.create_chat_completion(
-            messages=cleaned,
-            max_tokens=24,
+        result: dict[str, Any] = model.create_chat_completion(
+            messages=messages,
+            max_tokens=48,
             temperature=0.7,
             top_p=0.85,
             repeat_penalty=1.1,
         )
-        reply = (result.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        reply = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
         if not reply:
-            reply = "جواب قابل‌نمایشی تولید نشد؛ سؤال را کوتاه‌تر بپرس."
-        return jsonify({"reply": reply})
-    except Exception as exc:
-        app.logger.exception("Local Qwen inference failed")
-        return jsonify({"error": "مدل اجرا نشد. Logs در Render را بررسی کن. جزئیات: " + str(exc)[:220]}), 500
+            reply = "جواب قابل‌نمایشی تولید نشد؛ لطفاً سؤال کوتاه‌تری بپرس."
+
+        history.extend(
+            [
+                {"role": "user", "content": user_text[:700]},
+                {"role": "assistant", "content": reply},
+            ]
+        )
+        # Retain only two recent user/assistant turns per chat.
+        _conversations[chat_id] = history[-4:]
+        return reply
+
+
+async def process_and_reply(bot: Bot, event: Any, user_text: str) -> None:
+    """Acknowledge immediately, then generate and send the final answer."""
+    try:
+        await event.reply(
+            "پیامت رسید ✅\nدارم جواب رو با مدل محلی Qwen تولید می‌کنم. "
+            "بار اول ممکنه دانلود مدل حدود ۴۹۱ مگابایتی زمان ببره."
+        )
+    except Exception:
+        logger.exception("Could not send the initial acknowledgement to Rubika")
+
+    try:
+        chat_id = str(getattr(event, "chat_id", "") or "unknown-chat")
+        reply = await asyncio.to_thread(generate_reply_sync, chat_id, user_text)
+        # Rubika messages have practical length limits; the model is configured for short answers.
+        await event.reply(reply[:3500])
+        logger.info("Replied successfully to chat %s", chat_id)
+    except Exception:
+        logger.exception("Local Qwen inference failed")
+        try:
+            await event.reply(
+                "متأسفانه مدل نتونست جواب بسازه. لطفاً Logs در Render رو بررسی کن؛ "
+                "ممکنه مدل دانلود نشده باشه یا RAM هاست کافی نباشه."
+            )
+        except Exception:
+            logger.exception("Could not send the inference-error message to Rubika")
+
+
+async def main() -> None:
+    token = os.environ.get("BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError(
+            "Missing BOT_TOKEN environment variable. Add BOT_TOKEN in Render Environment."
+        )
+
+    bot = Bot(token, show_welcome=False)
+    active_tasks: set[asyncio.Task] = set()
+
+    @bot.on_message()
+    async def on_message(bot_instance: Bot, event: Any) -> None:
+        try:
+            if getattr(event, "update_type", None) not in (None, "NewMessage"):
+                return
+            # Avoid responding to other bots if the library supplies sender_type.
+            if getattr(event, "sender_type", None) == "Bot":
+                return
+
+            text = (getattr(event, "text", None) or "").strip()
+            if not text:
+                return
+
+            normalized = text.casefold()
+            if normalized in {"/start", "start", "/شروع", "شروع"}:
+                await event.reply(
+                    "سلام! من چت‌بات Qwen هستم و پاسخ‌ها را با یک مدل محلی تولید می‌کنم.\n"
+                    "هر سؤال متنی بفرستی، آن را به مدل می‌دهم.\n\n"
+                    "توجه: روی هاست رایگان با ۵۱۲ مگابایت RAM ممکن است مدل کند باشد یا به کمبود حافظه بخورد."
+                )
+                return
+            if normalized in {"/help", "help", "راهنما"}:
+                await event.reply("سؤالت رو به صورت پیام متنی بفرست. برای شروع هم /start رو ارسال کن.")
+                return
+
+            task = asyncio.create_task(process_and_reply(bot_instance, event, text))
+            active_tasks.add(task)
+            task.add_done_callback(active_tasks.discard)
+        except Exception:
+            logger.exception("Failed while handling a Rubika update")
+
+    port = int(os.environ.get("PORT", "10000"))
+    public_url = (
+        os.environ.get("RENDER_EXTERNAL_URL")
+        or os.environ.get("PUBLIC_URL")
+        or "https://ai-model-c2f5.onrender.com"
+    ).rstrip("/")
+
+    logger.info("Starting MAXRubika webhook server on port %s", port)
+    logger.info("Registering Rubika webhook at %s/wk", public_url)
+    # MAXRubika registers the Rubika endpoints and serves incoming updates on /wk.
+    # Webhook mode suits a Render Web Service better than a polling-only background loop.
+    await bot.start(
+        webhook_url=public_url,
+        webhook_path="/wk",
+        host="0.0.0.0",
+        port=port,
+    )
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped")
+    except Exception:
+        logger.exception("The Rubika bot could not start")
+        raise
