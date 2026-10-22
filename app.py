@@ -78,9 +78,10 @@ def get_model():
         # These settings reduce memory use; they cannot make a 491 MB model fit in 512 MB reliably.
         _model = Llama(
             model_path=str(MODEL_PATH),
-            n_ctx=256,
+            n_ctx=128,
             n_threads=1,
-            n_batch=8,
+            n_batch=64,
+            n_ubatch=8,
             n_gpu_layers=0,
             use_mmap=True,
             use_mlock=False,
@@ -120,7 +121,7 @@ def chat():
         model = get_model()
         result = model.create_chat_completion(
             messages=cleaned,
-            max_tokens=64,
+            max_tokens=24,
             temperature=0.7,
             top_p=0.85,
             repeat_penalty=1.1,
