@@ -32,10 +32,17 @@ _model: Llama | None = None
 _model_lock = threading.Lock()
 _inference_lock = threading.Lock()
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. Reply briefly in the same language as the user. "
-    "If the user writes Persian, try to answer in Persian. Be honest if you do not know."
-)
+SYSTEM_PROMPT = """
+تو یک دستیار هوش مصنوعی فارسی‌زبان هستی.
+- اگر کاربر فارسی نوشت، فقط فارسی روان و طبیعی پاسخ بده؛ واژه‌ها و جمله‌های بی‌ربط نساز.
+- دقیقاً به سؤال کاربر جواب بده و موضوع دیگری را وارد پاسخ نکن.
+- اگر کاربر سلام کرد، کوتاه و طبیعی سلام کن.
+- اگر پرسید نامت چیست، بگو: «من دستیار هوش مصنوعی Qwen هستم.»
+- اگر پرسید از چه مدلی استفاده می‌کنی، بگو: «مدل من Qwen2.5-0.5B-Instruct است.»
+- ادعا نکن انسان هستی و نام دیگری برای خودت نساز.
+- اگر جواب را نمی‌دانی، صادقانه بگو.
+- پاسخ معمولاً یک تا سه جمله باشد.
+""".strip()
 
 # Keep a short conversation history separately for each Rubika chat.
 # Entries are protected by _inference_lock because model generation is serialized.
@@ -89,6 +96,7 @@ def get_model() -> Llama:
         logger.info("Loading Qwen model into memory. The free 512 MB plan may run out of RAM.")
         _model = Llama(
             model_path=str(MODEL_PATH),
+            chat_format="chatml",
             n_ctx=128,
             n_threads=1,
             n_threads_batch=1,
@@ -115,10 +123,10 @@ def generate_reply_sync(chat_id: str, user_text: str) -> str:
         model = get_model()
         result: dict[str, Any] = model.create_chat_completion(
             messages=messages,
-            max_tokens=48,
-            temperature=0.7,
-            top_p=0.85,
-            repeat_penalty=1.1,
+            max_tokens=64,
+            temperature=0.25,
+            top_p=0.8,
+            repeat_penalty=1.05,
         )
         reply = (
             result.get("choices", [{}])[0]
@@ -180,14 +188,27 @@ async def main() -> None:
     @bot.on_message()
     async def on_message(bot_instance: Bot, event: Any) -> None:
         try:
-            if getattr(event, "update_type", None) not in (None, "NewMessage"):
+            # Log metadata only (not user message contents) to diagnose webhook delivery.
+            update_type = str(getattr(event, "update_type", "") or "").strip()
+            text = (getattr(event, "text", None) or "").strip()
+            chat_id = str(getattr(event, "chat_id", "") or "")
+            sender_type = str(getattr(event, "sender_type", "") or "")
+            logger.info(
+                "Rubika event received: update_type=%r, has_text=%s, text_length=%d, has_chat_id=%s, sender_type=%r",
+                update_type, bool(text), len(text), bool(chat_id), sender_type,
+            )
+
+            # Ignore only known non-chat updates. Unknown update labels are allowed
+            # through when they contain text, which helps with API payload variants.
+            if update_type in {"RemovedMessage", "InlineMessage", "StartedBot", "StoppedBot"}:
+                logger.info("Ignoring non-chat update type=%r", update_type)
                 return
             # Avoid responding to other bots if the library supplies sender_type.
-            if getattr(event, "sender_type", None) == "Bot":
+            if sender_type.casefold() == "bot":
+                logger.info("Ignoring message sent by a bot")
                 return
-
-            text = (getattr(event, "text", None) or "").strip()
             if not text:
+                logger.info("Ignoring Rubika event without text")
                 return
 
             normalized = text.casefold()
@@ -202,6 +223,7 @@ async def main() -> None:
                 await event.reply("سؤالت رو به صورت پیام متنی بفرست. برای شروع هم /start رو ارسال کن.")
                 return
 
+            logger.info("Queueing message for Qwen inference; text_length=%d, has_chat_id=%s", len(text), bool(chat_id))
             task = asyncio.create_task(process_and_reply(bot_instance, event, text))
             active_tasks.add(task)
             task.add_done_callback(active_tasks.discard)
